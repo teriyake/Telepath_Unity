@@ -217,6 +217,7 @@ public class TelepathEditorWindow : EditorWindow
             )
             {
                 NativeTelepath.SetLogLevel(TelepathManager.Instance.settings.logLevel);
+				Debug.Log($"[TelepathEditorWindow]: Successfully set Telepath Log Level to {TelepathManager.Instance.settings.logLevel}.");
             }
         }
         EditorGUI.indentLevel--;

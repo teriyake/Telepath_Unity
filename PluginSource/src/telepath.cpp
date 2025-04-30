@@ -1,22 +1,42 @@
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
-#include <errno.h>
 #include <iostream>
 #include <mutex>
-#include <netdb.h>
 #include <queue>
 #include <stdarg.h>
 #include <string>
-#include <sys/poll.h>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+typedef SOCKET socket_t;
+#define IS_SOCKET_INVALID(s) (s == INVALID_SOCKET)
+#define close_socket(s) closesocket(s)
+#define get_last_socket_error() WSAGetLastError()
+#define EWOULDBLOCK WSAEWOULDBLOCK
+#define EINTR WSAEINTR
+#else // POSIX
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
+typedef int socket_t;
+#define IS_SOCKET_INVALID(s) (s < 0)
+#define close_socket(s) close(s)
+#define get_last_socket_error() (errno)
+#endif
+
 
 #include "ip/UdpSocket.h"
 #include "osc/OscOutboundPacketStream.h"
@@ -107,8 +127,9 @@ protected:
 					}
 					else
 					{
-						// std::cerr << "[NativePlugin] OSC message queue
-						// overflow!" << std::endl;
+						LogToUnity(
+							LOG_ERROR,
+							"[NativePlugin] OSC message queue overflow!");
 						return;
 					}
 				}
@@ -123,22 +144,24 @@ protected:
 		}
 		catch (const osc::Exception& e)
 		{
-			std::cerr << "[NativePlugin] Error parsing OSC message: "
-					  << e.what() << " (Address: " << m.AddressPattern() << ")"
-					  << std::endl;
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Error parsing OSC message: %s (Address: %s)",
+				e.what(), m.AddressPattern());
 		}
 		catch (const std::exception& e)
 		{
-			std::cerr
-				<< "[NativePlugin] Standard exception processing OSC message: "
-				<< e.what() << " (Address: " << m.AddressPattern() << ")"
-				<< std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Standard exception processing OSC "
+					   "message: %s (Address: %s)",
+					   e.what(), m.AddressPattern());
 		}
 		catch (...)
 		{
-			std::cerr << "[NativePlugin] Unknown error processing OSC message "
-						 "(Address: "
-					  << m.AddressPattern() << ")" << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Unknown error processing OSC message "
+					   "(Address: %s)",
+					   m.AddressPattern());
 		}
 	}
 };
@@ -159,15 +182,16 @@ void ListenerThreadFunction(int port)
 	}
 	catch (const std::exception& e)
 	{
-		std::cerr << "[NativePlugin] OSC Listener thread exception: "
-				  << e.what() << std::endl;
+		LogToUnity(LOG_ERROR,
+				   "[NativePlugin] OSC Listener thread exception: %s",
+				   e.what());
 		delete g_receiveSocket;
 		g_receiveSocket = nullptr;
 	}
 	catch (...)
 	{
-		std::cerr << "[NativePlugin] OSC Listener thread unknown exception."
-				  << std::endl;
+		LogToUnity(LOG_ERROR,
+				   "[NativePlugin] OSC Listener thread unknown exception.");
 		delete g_receiveSocket;
 		g_receiveSocket = nullptr;
 	}
@@ -196,8 +220,74 @@ const size_t AUDIO_BUFFER_SIZE_SECONDS = 8;
 
 namespace
 {
+#ifdef _WIN32
+HANDLE g_audioShutdownEvent = NULL;
+#else // POSIX
 int audio_pipefd[2] = {-1, -1};
+#endif
 } // namespace
+
+namespace
+{
+
+#ifdef _WIN32
+// --- Windows-Specific Globals ---
+std::atomic<int> g_winsockInitCount = 0;
+std::mutex g_winsockMutex;
+
+bool InitializeWinsock()
+{
+	std::lock_guard<std::mutex> lock(g_winsockMutex);
+	if (g_winsockInitCount++ == 0)
+	{
+		WSADATA wsaData;
+		int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+		if (result != 0)
+		{
+			std::cerr << "[NativePlugin] WSAStartup failed: " << result
+					  << std::endl;
+			g_winsockInitCount = 0;
+			return false;
+		}
+		LogToUnity(LOG_DEBUG, "[NativePlugin] Winsock initialized.");
+	}
+	return true;
+}
+
+void ShutdownWinsock()
+{
+	std::lock_guard<std::mutex> lock(g_winsockMutex);
+	if (g_winsockInitCount == 0)
+		return;
+
+	if (--g_winsockInitCount == 0)
+	{
+		if (WSACleanup() == 0)
+		{
+			LogToUnity(LOG_DEBUG, "[NativePlugin] Winsock cleaned up.");
+		}
+		else
+		{
+			LogToUnity(LOG_ERROR, "[NativePlugin] WSACleanup failed: %d",
+					   WSAGetLastError());
+		}
+	}
+	// if (g_winsockInitCount < 0) {
+	//    LogToUnity(LOG_WARNING, "[NativePlugin] Winsock init count went
+	//    below zero!"); g_winsockInitCount = 0;
+	// }
+}
+#else // POSIX
+// define no-op versions for consistent calling code
+bool InitializeWinsock()
+{
+	return true;
+}
+void ShutdownWinsock() {}
+#endif
+
+} // namespace
+
 
 void AudioListenerThreadFunction(int port)
 {
@@ -209,14 +299,20 @@ void AudioListenerThreadFunction(int port)
 
 	try
 	{
-		audioSocket = socket(AF_INET, SOCK_DGRAM, 0);
-		if (audioSocket == -1)
+		audioSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (IS_SOCKET_INVALID(audioSocket))
 		{
-			std::cerr << "[NativePlugin] Failed to create audio socket: "
-					  << strerror(errno) << std::endl;
+#ifdef _WIN32
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Failed to  create audio socket: %d",
+					   get_last_socket_error());
+#else
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Failed to create audio socket: %s (%d)",
+					   strerror(get_last_socket_error()),
+					   get_last_socket_error());
+#endif
 			g_audioListenerRunning = false;
-			if (audio_pipefd[0] != -1)
-				close(audio_pipefd[0]);
 			return;
 		}
 
@@ -228,16 +324,20 @@ void AudioListenerThreadFunction(int port)
 		if (bind(audioSocket, (struct sockaddr*)&serverAddress,
 				 sizeof(serverAddress)) == -1)
 		{
-			std::cerr << "[NativePlugin] Failed to bind audio socket to port "
-					  << port << ": " << strerror(errno) << std::endl;
+#ifdef _WIN32
 			LogToUnity(
 				LOG_ERROR,
-				"[NativePlugin] Failed to bind audio socket to port %d: %s",
-				port, strerror(errno));
-			close(audioSocket);
+				"[NativePlugin] Failed to bind audio socket to port %d: %d",
+				port, get_last_socket_error());
+#else
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Failed to bind audio socket to port %d: "
+					   "%s (%d)",
+					   port, strerror(get_last_socket_error()),
+					   get_last_socket_error());
+#endif
+			close_socket(audioSocket);
 			g_audioListenerRunning = false;
-			if (audio_pipefd[0] != -1)
-				close(audio_pipefd[0]);
 			return;
 		}
 
@@ -248,49 +348,97 @@ void AudioListenerThreadFunction(int port)
 		const size_t MAX_PACKET_SIZE = 65507;
 		std::vector<char> buffer(MAX_PACKET_SIZE);
 
-		struct pollfd fds[2];
-		fds[0].fd = audioSocket;
-		fds[0].events = POLLIN;
-		fds[1].fd = audio_pipefd[0];
-		fds[1].events = POLLIN;
-
 		while (g_audioListenerRunning)
 		{
-			int pollResult = poll(fds, 2, 100);
+			int activity = -1;
 
-			if (pollResult == -1)
+#ifdef _WIN32
+			HANDLE waitHandles[2] = {(HANDLE)audioSocket, g_audioShutdownEvent};
+			fd_set readfds;
+			FD_ZERO(&readfds);
+			FD_SET(audioSocket, &readfds);
+			struct timeval tv;
+			tv.tv_sec = 0;
+			tv.tv_usec = 100 * 1000;
+
+			if (WaitForSingleObject(g_audioShutdownEvent, 0) == WAIT_OBJECT_0)
 			{
-				if (errno != EINTR)
+				LogToUnity(LOG_INFO,
+						   "[NativePlugin] Audio shutdown signal received.");
+				g_audioListenerRunning = false;
+				break;
+			}
+
+			activity = select(0, &readfds, NULL, NULL, &tv);
+
+#else // POSIX
+			struct pollfd fds[2];
+			fds[0].fd = audioSocket;
+			fds[0].events = POLLIN;
+			fds[1].fd = audio_pipefd[0];
+			fds[1].events = POLLIN;
+
+			activity = poll(fds, 2, 100);
+#endif
+			if (activity == -1)
+			{
+#ifdef _WIN32
+				int error_code = get_last_socket_error();
+				if (error_code != WSAEINTR)
 				{
-					std::cerr << "[NativePlugin] Audio listener poll error: "
-							  << strerror(errno) << std::endl;
+					LogToUnity(LOG_ERROR,
+							   "[NativePlugin] Audio listener select error: %d",
+							   error_code);
 					g_audioListenerRunning = false;
 				}
+#else // POSIX
+				if (errno != EINTR)
+				{
+					LogToUnity(LOG_ERROR,
+							   "[NativePlugin] Audio listener poll error: %s",
+							   strerror(errno));
+					g_audioListenerRunning = false;
+				}
+#endif
 				continue;
 			}
 
-			if (pollResult == 0)
+			if (activity == 0)
 			{
 				continue;
 			}
 
-			if (fds[0].revents & POLLIN)
+			bool data_received = false;
+#ifdef _WIN32
+			if (activity > 0 && FD_ISSET(audioSocket, &readfds))
+			{
+				data_received = true;
+			}
+#else // POSIX
+			if (activity > 0 && (fds[0].revents & POLLIN))
+			{
+				data_received = true;
+			}
+#endif
+
+			if (data_received)
 			{
 				sockaddr_storage clientAddress{};
 				socklen_t clientAddressLen = sizeof(clientAddress);
 				size_t bytesReceived = recvfrom(
-					audioSocket, buffer.data(), buffer.size(), 0,
-					(struct sockaddr*)&clientAddress, &clientAddressLen);
+					audioSocket, buffer.data(), static_cast<int>(buffer.size()),
+					0, (struct sockaddr*)&clientAddress, &clientAddressLen);
 
 				if (bytesReceived == (size_t)-1)
 				{
-					if (errno != EAGAIN && errno != EWOULDBLOCK)
+					int error_code = get_last_socket_error();
+					if (error_code != EWOULDBLOCK && error_code != EAGAIN)
 					{
-						std::cerr << "[NativePlugin] Audio recvfrom error: "
-								  << strerror(errno) << std::endl;
+						LogToUnity(LOG_ERROR,
+								   "[NativePlugin] Audio recvfrom error: %d",
+								   error_code);
 						g_audioListenerRunning = false;
 					}
-					continue;
 				}
 				if (bytesReceived > 0)
 				{
@@ -333,6 +481,7 @@ void AudioListenerThreadFunction(int port)
 				}
 			}
 
+#ifndef _WIN32
 			if (fds[1].revents & POLLIN)
 			{
 				char signal_byte;
@@ -341,24 +490,25 @@ void AudioListenerThreadFunction(int port)
 				LogToUnity(LOG_INFO,
 						   "[NativePlugin] Audio shutdown signal received.");
 			}
+#endif
 		}
 	}
 	catch (const std::exception& e)
 	{
-		std::cerr << "[NativePlugin] Audio Listener thread exception: "
-				  << e.what() << std::endl;
+		LogToUnity(LOG_ERROR,
+				   "[NativePlugin] Audio Listener thread exception: %s",
+				   e.what());
 	}
 	catch (...)
 	{
-		std::cerr << "[NativePlugin] Audio Listener thread unknown exception."
-				  << std::endl;
+		LogToUnity(LOG_ERROR,
+				   "[NativePlugin] Audio Listener thread unknown exception.");
 	}
 
-	if (audioSocket != -1)
-		close(audioSocket);
-	if (audio_pipefd[0] != -1)
-		close(audio_pipefd[0]);
-	audio_pipefd[0] = -1;
+	if (!IS_SOCKET_INVALID(audioSocket))
+	{
+		close_socket(audioSocket);
+	}
 
 	g_audioListenerRunning = false;
 	LogToUnity(LOG_INFO, "[NativePlugin] Audio Listener thread stopped.");
@@ -369,14 +519,20 @@ extern "C"
 {
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
+#ifdef _WIN32
+#define DLL_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
 #define DLL_EXPORT __attribute__((visibility("default")))
 #else
-#error "Unsupported compiler" // TODO: Add Windows __declspec(dllexport) later
+#define DLL_EXPORT
+#warning "Compiler does not support DLL export directives"
 #endif
 
 	DLL_EXPORT bool InitializeTelepathAudioListener(int port)
 	{
+		if (!InitializeWinsock())
+			return false;
+
 		if (g_audioListenerRunning)
 		{
 			LogToUnity(LOG_INFO,
@@ -391,6 +547,8 @@ extern "C"
 					   "[NativePlugin] InitializeTelepathAudioListener: "
 					   "Invalid port %d.",
 					   port);
+
+			ShutdownWinsock();
 			return false;
 		}
 
@@ -404,16 +562,30 @@ extern "C"
 		g_audioCircularBuffer.resize(g_audioBufferSize);
 		g_audioWriteIndex = 0;
 		g_audioReadIndex = 0;
-
-		if (pipe(audio_pipefd) == -1)
+#ifdef _WIN32
+		g_audioShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		if (g_audioShutdownEvent == NULL)
 		{
-			std::cerr << "[NativePlugin] Failed to create audio shutdown pipe: "
-					  << strerror(errno) << std::endl;
-			g_audioBufferSize = 0;
-			g_audioCircularBuffer.clear();
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Failed to create audio shutdown event: %lu",
+				GetLastError());
+			ShutdownWinsock();
 			return false;
 		}
-		LogToUnity(LOG_INFO, "[NativePlugin] Audio shutdown pipe created.");
+		LogToUnity(LOG_INFO, "[NativePlugin] Audio shutdown event created.");
+#else // POSIX
+	if (pipe(audio_pipefd) == -1)
+	{
+		LogToUnity(LOG_ERROR,
+				   "[NativePlugin] Failed to create audio shutdown pipe: %s",
+				   strerror(errno));
+		g_audioBufferSize = 0;
+		g_audioCircularBuffer.clear();
+		return false;
+	}
+	LogToUnity(LOG_INFO, "[NativePlugin] Audio shutdown pipe created.");
+#endif
 
 		try
 		{
@@ -424,30 +596,46 @@ extern "C"
 		}
 		catch (const std::system_error& e)
 		{
-			std::cerr
-				<< "[NativePlugin] Failed to create audio listener thread: "
-				<< e.what() << " (" << e.code() << ")" << std::endl;
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Failed to create audio listener thread: %s",
+				e.what());
 			g_audioListenerRunning = false;
 			g_audioBufferSize = 0;
 			g_audioCircularBuffer.clear();
-			close(audio_pipefd[0]);
-			close(audio_pipefd[1]);
-			audio_pipefd[0] = -1;
-			audio_pipefd[1] = -1;
+#ifdef _WIN32
+			if (g_audioShutdownEvent != NULL)
+				CloseHandle(g_audioShutdownEvent);
+			g_audioShutdownEvent = NULL;
+#else // POSIX
+		close(audio_pipefd[0]);
+		close(audio_pipefd[1]);
+		audio_pipefd[0] = -1;
+		audio_pipefd[1] = -1;
+#endif
+			ShutdownWinsock();
 			return false;
 		}
 		catch (...)
 		{
-			std::cerr << "[NativePlugin] Unknown error creating audio listener "
-						 "thread."
-					  << std::endl;
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Unknown error creating audio listener thread.");
 			g_audioListenerRunning = false;
 			g_audioBufferSize = 0;
 			g_audioCircularBuffer.clear();
-			close(audio_pipefd[0]);
-			close(audio_pipefd[1]);
-			audio_pipefd[0] = -1;
-			audio_pipefd[1] = -1;
+
+#ifdef _WIN32
+			if (g_audioShutdownEvent != NULL)
+				CloseHandle(g_audioShutdownEvent);
+			g_audioShutdownEvent = NULL;
+#else // POSIX
+		close(audio_pipefd[0]);
+		close(audio_pipefd[1]);
+		audio_pipefd[0] = -1;
+		audio_pipefd[1] = -1;
+#endif
+			ShutdownWinsock();
 			return false;
 		}
 	}
@@ -459,41 +647,57 @@ extern "C"
 			LogToUnity(LOG_INFO,
 					   "[NativePlugin] ShutdownTelepathAudioListener: Listener "
 					   "not running or already shut down.");
+			ShutdownWinsock();
 			return;
 		}
 
 		LogToUnity(LOG_INFO,
 				   "[NativePlugin] ShutdownTelepathAudioListener: Stopping "
 				   "listener...");
-
 		g_audioListenerRunning = false;
 
-		if (audio_pipefd[1] != -1)
+#ifdef _WIN32
+		if (g_audioShutdownEvent != NULL)
 		{
-			char signal_byte = 1;
-			if (write(audio_pipefd[1], &signal_byte, 1) == -1)
-			{
-				std::cerr
-					<< "[NativePlugin] Failed to write to audio shutdown pipe: "
-					<< strerror(errno) << std::endl;
-			}
+			SetEvent(g_audioShutdownEvent);
 		}
+#else // POSIX
+	if (audio_pipefd[1] != -1)
+	{
+		char signal_byte = 1;
+		if (write(audio_pipefd[1], &signal_byte, 1) == -1)
+		{
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Failed to write to audio shutdown pipe: %s",
+				strerror(errno));
+		}
+	}
+#endif
 
 		if (g_audioListenerThread.joinable())
 		{
 			g_audioListenerThread.join();
 		}
 
-		if (audio_pipefd[0] != -1)
+#ifdef _WIN32
+		if (g_audioShutdownEvent != NULL)
 		{
-			close(audio_pipefd[0]);
-			audio_pipefd[0] = -1;
+			CloseHandle(g_audioShutdownEvent);
+			g_audioShutdownEvent = NULL;
 		}
-		if (audio_pipefd[1] != -1)
-		{
-			close(audio_pipefd[1]);
-			audio_pipefd[1] = -1;
-		}
+#else // POSIX
+	if (audio_pipefd[0] != -1)
+	{
+		close(audio_pipefd[0]);
+		audio_pipefd[0] = -1;
+	}
+	if (audio_pipefd[1] != -1)
+	{
+		close(audio_pipefd[1]);
+		audio_pipefd[1] = -1;
+	}
+#endif
 
 		g_audioCircularBuffer.clear();
 		g_audioBufferSize = 0;
@@ -502,6 +706,7 @@ extern "C"
 
 		LogToUnity(LOG_INFO,
 				   "[NativePlugin] Audio Listener shut down complete.");
+		ShutdownWinsock();
 	}
 
 	DLL_EXPORT void RegisterDebugCallback(DebugLogFuncPtr callback)
@@ -582,8 +787,8 @@ extern "C"
 		}
 		if (dataName == nullptr || *dataName == '\0')
 		{
-			// std::cerr << "[NativePlugin] Warning: SendGameData called
-			// with null or empty dataName." << std::endl;
+			// LogToUnity(LOG_ERROR, "[NativePlugin] Warning: SendGameData
+			// called with null or empty dataName.");
 			return;
 		}
 
@@ -614,13 +819,15 @@ extern "C"
 		}
 		catch (const std::exception& e)
 		{
-			std::cerr << "[NativePlugin] Error sending OSC message ("
-					  << dataName << "): " << e.what() << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Error sending OSC message (%s): %s",
+					   dataName, e.what());
 		}
 		catch (...)
 		{
-			std::cerr << "[NativePlugin] Unknown error sending OSC message ("
-					  << dataName << ")." << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Unknown error sending OSC message (%s).",
+					   dataName);
 		}
 	}
 
@@ -631,6 +838,9 @@ extern "C"
 
 	DLL_EXPORT bool InitializeTelepath()
 	{
+		if (!InitializeWinsock())
+			return false;
+
 		std::lock_guard<std::mutex> guard(g_socketMutex);
 
 		if (g_isInitialized)
@@ -662,29 +872,35 @@ extern "C"
 			}
 			else
 			{
-				std::cerr << "[NativePlugin] Error: Failed to create "
-							 "UdpTransmitSocket "
-							 "object (returned null)."
-						  << std::endl;
+				LogToUnity(LOG_ERROR,
+						   "[NativePlugin] Error: Failed to create "
+						   "UdpTransmitSocket object (returned null).");
+
+				ShutdownWinsock();
 				return false;
 			}
 		}
 		catch (const std::exception& e)
 		{
-			std::cerr << "[NativePlugin] Error initializing UDP socket: "
-					  << e.what() << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Error initializing UDP socket: %s",
+					   e.what());
 			delete g_transmitSocket;
 			g_transmitSocket = nullptr;
 			g_isInitialized = false;
+
+			ShutdownWinsock();
 			return false;
 		}
 		catch (...)
 		{
-			std::cerr << "[NativePlugin] Unknown error initializing UDP socket."
-					  << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Unknown error initializing UDP socket.");
 			delete g_transmitSocket;
 			g_transmitSocket = nullptr;
 			g_isInitialized = false;
+
+			ShutdownWinsock();
 			return false;
 		}
 	}
@@ -711,34 +927,45 @@ extern "C"
 			LogToUnity(LOG_INFO, "[NativePlugin] OSC UDP socket closed.");
 		}
 		g_isInitialized = false;
+
+		ShutdownWinsock();
 	}
 
 	DLL_EXPORT bool InitializeTelepathListener(int port)
 	{
+		if (!InitializeWinsock())
+			return false;
+
 		if (g_listenerRunning)
 		{
 			if (port == g_listenPort)
 			{
-				std::cout
-					<< "[NativePlugin] InitializeTelepathListener: Already "
-					   "running on port "
-					<< port << "." << std::endl;
+				LogToUnity(LOG_DEBUG,
+						   "[NativePlugin] InitializeTelepathListener: Already "
+						   "running on port %d",
+						   port);
 				return true;
 			}
 			else
 			{
-				std::cerr
-					<< "[NativePlugin] InitializeTelepathListener: Already "
-					   "running on different port "
-					<< g_listenPort << ". Please Shutdown first." << std::endl;
+				LogToUnity(
+					LOG_ERROR,
+					"[NativePlugin] InitializeTelepathListener: Already "
+					"running on different port %d. Please Shutdown first.",
+					g_listenPort);
+
+				ShutdownWinsock();
 				return false;
 			}
 		}
 		if (port <= 0 || port >= 65536)
 		{
-			std::cerr << "[NativePlugin] InitializeTelepathListener: "
-						 "Invalid port "
-					  << port << "." << std::endl;
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] InitializeTelepathListener: Invalid port %d.",
+				port);
+
+			ShutdownWinsock();
 			return false;
 		}
 
@@ -759,19 +986,24 @@ extern "C"
 		}
 		catch (const std::system_error& e)
 		{
-			std::cerr << "[NativePlugin] Failed to create listener thread: "
-					  << e.what() << " (" << e.code() << ")" << std::endl;
+			LogToUnity(LOG_ERROR,
+					   "[NativePlugin] Failed to create listener thread: %s",
+					   e.what());
 			g_listenerRunning = false;
 			g_listenPort = 0;
+
+			ShutdownWinsock();
 			return false;
 		}
 		catch (...)
 		{
-			std::cerr
-				<< "[NativePlugin] Unknown error creating listener thread."
-				<< std::endl;
+			LogToUnity(
+				LOG_ERROR,
+				"[NativePlugin] Unknown error creating listener thread.");
 			g_listenerRunning = false;
 			g_listenPort = 0;
+
+			ShutdownWinsock();
 			return false;
 		}
 	}
@@ -780,10 +1012,9 @@ extern "C"
 	{
 		if (!g_listenerRunning && !g_listenerThread.joinable())
 		{
-			std::cout
-				<< "[NativePlugin] ShutdownTelepathListener: Listener not "
-				   "running or already shut down."
-				<< std::endl;
+			LogToUnity(LOG_DEBUG,
+					   "[NativePlugin] ShutdownTelepathListener: Listener not "
+					   "running or already shut down.");
 			return;
 		}
 
@@ -810,6 +1041,8 @@ extern "C"
 		std::lock_guard<std::mutex> lock(g_messageQueueMutex);
 		std::queue<ReceivedOscMessage> emptyQueue;
 		std::swap(g_messageQueue, emptyQueue);
+
+		ShutdownWinsock();
 	}
 
 	DLL_EXPORT bool IsTelepathListenerRunning()
@@ -824,8 +1057,9 @@ extern "C"
 		{
 			if (!g_errorLoggedListenerNotInit)
 			{
-				// std::cerr << "[NativePlugin] GetNextOscMessage: Listener
-				// not running." << std::endl;
+				LogToUnity(
+					LOG_DEBUG,
+					"[NativePlugin] GetNextOscMessage: Listener not running.");
 				g_errorLoggedListenerNotInit = true;
 			}
 			return false;

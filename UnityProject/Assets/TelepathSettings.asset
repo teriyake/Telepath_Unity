@@ -19,5 +19,5 @@ MonoBehaviour:
   listenPort: 9001
   autoStartListenerOnStart: 0
   audioListenPort: 7002
-  autoStartAudioListenerOnStart: 1
-  logLevel: 0
+  autoStartAudioListenerOnStart: 0
+  logLevel: 1
