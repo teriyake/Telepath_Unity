@@ -1,3 +1,0 @@
-/Users/teriyake/Documents/projects/Telepath_Unity/PluginSource/build/CMakeFiles/Telepath.dir
-/Users/teriyake/Documents/projects/Telepath_Unity/PluginSource/build/CMakeFiles/edit_cache.dir
-/Users/teriyake/Documents/projects/Telepath_Unity/PluginSource/build/CMakeFiles/rebuild_cache.dir
